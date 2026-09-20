@@ -14,6 +14,9 @@
 升级模式（POST /upgrade 使用，见 upgrade()）：
 * 逐一枚举严格高于当前版本的目标候选（降序），钉住 ``==版本`` 后整体求解，
   第一个存在可行解的候选即为升级目标版本；
+* 预发布候选默认遵循 allow_prereleases 开关；目标包即根包时，用户提交的
+  根约束按 PEP 440 跟随语义放行其显式提到的预发布版本（升级器内部生成的
+  ``==候选版本`` 钉选不参与该判定）；
 * 对确定的钉版本，求解器不再返回首个解，而是按既定确定性顺序枚举全部解，
   保留“非目标包相对 current_lock 的新增/删除/版本变化数量”最少的解；
   数量相同时，枚举顺序保证先遇到的（即普通模式会选中的）解胜出；
@@ -329,9 +332,24 @@ class Resolver:
     # 升级（POST /upgrade）
     # ------------------------------------------------------------------ #
     def higher_candidates(
-        self, target: str, current_version: Version
+        self,
+        target: str,
+        current_version: Version,
+        *,
+        root_name: str | None = None,
+        root_spec: SpecifierSet | None = None,
     ) -> list[Candidate]:
-        """严格高于 current_version 的候选（遵循预发布开关），按版本降序。"""
+        """严格高于 current_version 的候选（遵循预发布开关），按版本降序。
+
+        预发布候选在 ``allow_prereleases=False`` 时默认排除；唯一例外：
+        目标包即根包（PEP 503 规范化后同名），且用户提交的根约束按
+        PEP 440 跟随语义显式放行预发布（如 ``==2.0rc1`` / ``>=2.0a1``，
+        谓词 ``prereleases=True``）——此时满足根约束的预发布候选照常
+        参与枚举，与 /resolve 对根包的约束处理一致。判定只依据用户提交
+        的根约束：升级器内部为逐候选求解生成的 ``==候选版本`` 钉选不参与
+        （否则每个预发布候选都会被自己的钉选放行，默认排除形同虚设）。
+        """
+        target_is_root = root_name is not None and canonical(root_name) == target
         higher = []
         for cand in self.repo.candidates(target):
             if cand.version <= current_version:
@@ -339,7 +357,15 @@ class Resolver:
             if not self.allow_prereleases and (
                 cand.version.is_prerelease or cand.version.is_devrelease
             ):
-                continue
+                follows_user_spec = (
+                    target_is_root
+                    and root_spec is not None
+                    and version_satisfies(
+                        cand.version, root_spec, allow_prereleases=False
+                    )
+                )
+                if not follows_user_spec:
+                    continue
             higher.append(cand)
         return higher
 
@@ -360,9 +386,18 @@ class Resolver:
         目标版本。对该版本枚举全部解，返回非目标包相对 reference
         （current_lock）变化最少的解；数量相同按既定确定性顺序取先遇到者。
         所有更高候选均无解时返回 None；超上限抛 ResolutionLimit。
+
+        预发布候选默认遵循 ``allow_prereleases`` 开关；target 与根包
+        规范化后同名时，用户提交的根约束按 PEP 440 跟随语义放行其显式
+        提到的预发布版本（见 higher_candidates）。
         """
         target = canonical(target)
-        for cand in self.higher_candidates(target, current_version):
+        for cand in self.higher_candidates(
+            target,
+            current_version,
+            root_name=root_name,
+            root_spec=root_spec,
+        ):
             pin = Requirement(
                 target,
                 SpecifierSet(f"=={cand.version}"),

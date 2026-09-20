@@ -328,6 +328,127 @@ def test_upgrade_prerelease_candidates_follow_toggle():
     assert r2.json()["locked"]["libx"] == "2.0rc1"
 
 
+# --------------------------------------------------------------------- #
+# 7b. target == root 时的预发布跟随语义（根 specifier 为用户提交的约束）
+# --------------------------------------------------------------------- #
+def test_upgrade_root_prerelease_allowed_by_explicit_root_pin():
+    """target 与 root 同名、根 specifier 显式钉住更高预发布：候选放行，
+    不再在整体求解前被丢弃而误报 409。"""
+    repo = {
+        "app": [c("1.0"), c("2.0rc1")],
+    }
+    r = upgrade(repo, {"app": "1.0"}, "app", specifier="==2.0rc1")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["root_version"] == "2.0rc1"
+    assert body["locked"] == {"app": "2.0rc1"}
+    assert body["changes"] == [{"name": "app", "from": "1.0", "to": "2.0rc1"}]
+
+
+def test_upgrade_root_prerelease_allowed_by_root_range_mentioning_prerelease():
+    """根 specifier 为显式包含预发布的区间（>=2.0a1）：跟随语义放行，
+    并取满足约束的最高候选（不满足 ==钉选 的更高预发布不参与）。"""
+    repo = {
+        "app": [c("1.0"), c("2.0rc1"), c("2.0rc2")],
+    }
+    r = upgrade(repo, {"app": "1.0"}, "app", specifier=">=2.0a1")
+    assert r.status_code == 200, r.text
+    assert r.json()["locked"] == {"app": "2.0rc2"}
+
+    # 显式钉住 ==2.0rc1 时，更高的 2.0rc2 不满足根约束，目标版本为 2.0rc1
+    r2 = upgrade(repo, {"app": "1.0"}, "app", specifier="==2.0rc1")
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["locked"] == {"app": "2.0rc1"}
+
+
+def test_upgrade_root_prerelease_stable_still_wins_as_highest():
+    """根约束放行预发布后，更高的稳定版仍是最高可行目标版本。"""
+    repo = {
+        "app": [c("1.0"), c("2.0rc1"), c("2.0")],
+    }
+    r = upgrade(repo, {"app": "1.0"}, "app", specifier=">=2.0a1")
+    assert r.status_code == 200, r.text
+    assert r.json()["locked"] == {"app": "2.0"}
+
+
+def test_upgrade_root_prerelease_excluded_by_default():
+    """普通未约束请求（无 specifier）：更高预发布仍被排除，返回 409。"""
+    repo = {
+        "app": [c("1.0"), c("2.0rc1")],
+    }
+    r = upgrade(repo, {"app": "1.0"}, "app")
+    assert r.status_code == 409
+    assert r.json()["status"] == "conflict"
+
+
+def test_upgrade_root_prerelease_excluded_when_root_spec_has_no_prerelease():
+    """根约束未提到预发布（>=1.0,<3.0）：预发布候选仍按默认排除。"""
+    repo = {
+        "app": [c("1.0"), c("2.0rc1")],
+    }
+    r = upgrade(repo, {"app": "1.0"}, "app", specifier=">=1.0,<3.0")
+    assert r.status_code == 409
+    assert r.json()["status"] == "conflict"
+
+
+def test_upgrade_root_prerelease_infeasible_pin_still_409():
+    """显式钉住的预发布被放行但其传递依赖无解：仍返回 409 与冲突来源链。"""
+    repo = {
+        "app": [c("1.0"), c("2.0rc1", [d("ghost", ">=9")])],
+    }
+    r = upgrade(repo, {"app": "1.0"}, "app", specifier="==2.0rc1")
+    assert r.status_code == 409
+    body = r.json()
+    assert body["status"] == "conflict"
+    assert body["conflicts"]
+    assert body["conflicts"][0]["constraints"]
+
+
+def test_upgrade_root_prerelease_minimizes_non_target_changes():
+    """放行预发布后最小变更与确定性不变：liby 保持 current_lock 版本。"""
+    repo = {
+        "app": [c("1.0", [d("liby")]), c("2.0rc1", [d("liby")])],
+        "liby": [c("1.0"), c("2.0")],
+    }
+    lock = {"app": "1.0", "liby": "1.0"}
+    r = upgrade(repo, lock, "app", specifier="==2.0rc1")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["locked"] == {"app": "2.0rc1", "liby": "1.0"}
+    assert body["changes"] == [{"name": "app", "from": "1.0", "to": "2.0rc1"}]
+    # 确定性：重复调用结果逐字节一致
+    assert upgrade(repo, lock, "app", specifier="==2.0rc1").json() == body
+
+
+def test_upgrade_root_prerelease_target_root_match_is_canonicalized():
+    """target 与 root 的同一性按 PEP 503 规范化判断（My_App ≡ my-app）。"""
+    repo = {
+        "my_app": [c("1.0"), c("2.0rc1")],
+    }
+    body = {
+        "repository": repo,
+        "root": "My_App",
+        "specifier": "==2.0rc1",
+        "target_environment": ENV,
+        "current_lock": {"my.app": "1.0"},
+        "target": "MY-APP",
+    }
+    r = client.post("/upgrade", json=body)
+    assert r.status_code == 200, r.text
+    assert r.json()["locked"] == {"my-app": "2.0rc1"}
+
+
+def test_upgrade_non_root_target_prerelease_still_excluded():
+    """target 不是根包时根约束不涉及目标包：预发布候选仍默认排除。"""
+    repo = {
+        "app": [c("1.0", [d("libx")])],
+        "libx": [c("1.0"), c("2.0rc1")],
+    }
+    r = upgrade(repo, {"app": "1.0", "libx": "1.0"}, "libx", specifier=">=1.0")
+    assert r.status_code == 409
+    assert r.json()["status"] == "conflict"
+
+
 def test_upgrade_deterministic_across_repeated_calls():
     repo = {
         "app": [c("1.0", [d("libx"), d("liby")])],
