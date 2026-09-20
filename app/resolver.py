@@ -14,6 +14,9 @@
 升级模式（POST /upgrade 使用，见 upgrade()）：
 * 逐一枚举严格高于当前版本的目标候选（降序），钉住 ``==版本`` 后整体求解，
   第一个存在可行解的候选即为升级目标版本；
+* 候选发现的预发布排除与 /resolve 共用 pip 跟随语义，但只认用户提交的显式
+  约束（target==root 时即根 ``specifier``）；内部为候选生成的 ``==候选版本``
+  钉选不触发预发布跟随，普通未约束请求仍排除预发布；
 * 对确定的钉版本，求解器不再返回首个解，而是按既定确定性顺序枚举全部解，
   保留“非目标包相对 current_lock 的新增/删除/版本变化数量”最少的解；
   数量相同时，枚举顺序保证先遇到的（即普通模式会选中的）解胜出；
@@ -329,14 +332,32 @@ class Resolver:
     # 升级（POST /upgrade）
     # ------------------------------------------------------------------ #
     def higher_candidates(
-        self, target: str, current_version: Version
+        self,
+        target: str,
+        current_version: Version,
+        *,
+        user_spec: SpecifierSet | None = None,
     ) -> list[Candidate]:
-        """严格高于 current_version 的候选（遵循预发布开关），按版本降序。"""
+        """严格高于 current_version 的候选，按版本降序。
+
+        预发布（含 dev）默认排除，与 ``version_satisfies`` 的 pip 跟随语义
+        一致：``allow_prereleases`` 放开、或**用户提交的**约束 ``user_spec``
+        中有谓词显式提到预发布版本（如 ``==2.0rc1``，该谓词
+        ``prereleases=True``）时才放行。
+
+        ``user_spec`` 只承载用户在请求里给出的显式约束（target==root 时为
+        根 ``specifier``）；升级器为每个候选内部生成的 ``==候选版本`` 钉选
+        不在此列——否则普通未约束请求会因钉选本身提到预发布而把该预发布
+        候选错误放行。钉选的过滤作用在后续整体求解中照常生效。
+        """
+        follows_prerelease = self.allow_prereleases or (
+            user_spec is not None and any(s.prereleases for s in user_spec)
+        )
         higher = []
         for cand in self.repo.candidates(target):
             if cand.version <= current_version:
                 continue
-            if not self.allow_prereleases and (
+            if not follows_prerelease and (
                 cand.version.is_prerelease or cand.version.is_devrelease
             ):
                 continue
@@ -360,9 +381,17 @@ class Resolver:
         目标版本。对该版本枚举全部解，返回非目标包相对 reference
         （current_lock）变化最少的解；数量相同按既定确定性顺序取先遇到者。
         所有更高候选均无解时返回 None；超上限抛 ResolutionLimit。
+
+        target 与 root 是同一个包时，候选发现把用户提交的根 ``specifier``
+        视为显式预发布约束（PEP 440 跟随语义：显式钉住/包含更高预发布时
+        放行）；target 为非根包时无用户直述约束，维持默认排除预发布。
+        两种情况下内部生成的 ``==候选版本`` 钉选都不触发跟随放行。
         """
         target = canonical(target)
-        for cand in self.higher_candidates(target, current_version):
+        user_spec = root_spec if target == canonical(root_name) else None
+        for cand in self.higher_candidates(
+            target, current_version, user_spec=user_spec
+        ):
             pin = Requirement(
                 target,
                 SpecifierSet(f"=={cand.version}"),
